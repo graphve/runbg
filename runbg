@@ -1,0 +1,134 @@
+#!/bin/bash
+# runbg: run a command in the background and keep it easy to track.
+#
+# Survives logout (detached + SIGHUP-immune), captures all output to a
+# log file, and gives you simple subcommands to check on or stop the job.
+
+set -u
+
+JOB_DIR="${RUNBG_DIR:-$HOME/jobs}"
+LOG_FILE="$JOB_DIR/runbg.log"
+PID_FILE="$JOB_DIR/runbg.pid"
+EXIT_FILE="$JOB_DIR/runbg.exit"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  runbg <command> [args...]     Start a job in the background
+  runbg log                     Follow the job's output (or show it if done)
+  runbg status                  Print job status
+  runbg stop                    Stop the running job (TERM, then KILL)
+  runbg -- <command> [args...]  Start a job whose name matches a subcommand
+
+Files (override the directory with the RUNBG_DIR env var):
+  ~/jobs/runbg.log   job output
+  ~/jobs/runbg.pid   pid while the job is running
+  ~/jobs/runbg.exit  exit code of the last finished job
+
+One job runs at a time per user.
+EOF
+}
+
+running_pid() {
+    [ -f "$PID_FILE" ] || return 1
+    local pid
+    pid=$(cat "$PID_FILE" 2>/dev/null) || return 1
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    kill -0 "$pid" 2>/dev/null || return 1
+    printf '%s\n' "$pid"
+}
+
+show_status() {
+    local pid
+    if pid=$(running_pid); then
+        echo "RUNBG: RUNNING"
+        echo "PID: $pid"
+    elif [ -f "$EXIT_FILE" ]; then
+        echo "RUNBG: FINISHED"
+        echo "Exit code: $(cat "$EXIT_FILE")"
+    elif [ -f "$LOG_FILE" ]; then
+        echo "RUNBG: FINISHED (exit code unknown; job was killed or crashed)"
+    else
+        echo "RUNBG: no job found"
+        return 1
+    fi
+}
+
+case "${1:-}" in
+    ""|-h|--help|help)
+        usage
+        [ "${1:-}" = "" ] && exit 1
+        exit 0
+        ;;
+    status)
+        show_status
+        exit $?
+        ;;
+    log)
+        show_status || exit 0
+        echo
+        if pid=$(running_pid); then
+            exec tail -f "$LOG_FILE"
+        elif [ -f "$LOG_FILE" ]; then
+            exec cat "$LOG_FILE"
+        fi
+        ;;
+    stop)
+        pid=$(running_pid) || { echo "No runbg job is running."; exit 1; }
+        echo "Stopping runbg job (PID $pid)..."
+        kill -TERM "$pid" 2>/dev/null
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.5
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "Still running after 5s, sending KILL."
+            kill -KILL "$pid" 2>/dev/null
+        fi
+        echo "Stopped. Log kept at $LOG_FILE"
+        exit 0
+        ;;
+esac
+
+# --- start a new job ---
+
+if pid=$(running_pid); then
+    echo "A runbg job is already running (PID $pid)."
+    echo "Use 'runbg log' to watch it, or 'runbg stop' to end it."
+    exit 1
+fi
+
+[ "${1:-}" = "--" ] && shift
+
+if [ $# -eq 0 ]; then
+    usage
+    exit 1
+fi
+
+if [ "$1" = "sudo" ]; then
+    echo "Note: 'sudo' inside a background job cannot ask for a password."
+    echo "If the job needs root, run: sudo runbg <command>"
+    echo
+fi
+
+mkdir -p "$JOB_DIR"
+: > "$LOG_FILE"
+rm -f "$EXIT_FILE"
+
+RUNBG_LOG="$LOG_FILE" RUNBG_EXIT="$EXIT_FILE" RUNBG_PIDF="$PID_FILE" \
+nohup bash -c '
+    trap "rm -f \"\$RUNBG_PIDF\"" EXIT
+    trap "kill -TERM \"\$jobpid\" 2>/dev/null; echo 143 >\"\$RUNBG_EXIT\"; exit 143" TERM INT
+    "$@" >"$RUNBG_LOG" 2>&1 &
+    jobpid=$!
+    wait "$jobpid"
+    echo "$?" >"$RUNBG_EXIT"
+' _ "$@" </dev/null >/dev/null 2>&1 &
+
+pid=$!
+echo "$pid" > "$PID_FILE"
+
+echo "Started in background."
+echo "PID: $pid"
+echo "Log: $LOG_FILE"
+echo "Track with: runbg log"
